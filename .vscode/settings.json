@@ -1,0 +1,13 @@
+{
+    "python.defaultInterpreterPath": "C:\\Users\\Syed Abdul Sami\\AppData\\Local\\Programs\\Python\\Python313\\python.exe",
+    "python.pythonPath": "C:\\Users\\Syed Abdul Sami\\AppData\\Local\\Programs\\Python\\Python313\\python.exe",
+    "python.analysis.extraPaths": [
+        "${workspaceFolder}",
+        "C:\\Users\\Syed Abdul Sami\\AppData\\Local\\Programs\\Python\\Python313\\Lib\\site-packages"
+    ],
+    "css.lint.unknownAtRules": "ignore",
+    "css.validate": false,
+    "tailwindCSS.includeLanguages": {
+        "javascriptreact": "javascript"
+    }
+}
