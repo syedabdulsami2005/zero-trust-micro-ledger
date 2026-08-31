@@ -50,6 +50,7 @@ class Storage:
         self.state_file = self.ledger_dir / "state.json"
         self.alerts_file = self.ledger_dir / "alerts.jsonl"
         self.audit_file = self.audit_dir / "user_activity.jsonl"
+        self.max_watched_file_bytes = 1024 * 1024  # 1 MiB
 
     # ── Directory management ───────────────────────────────────────────
 
@@ -215,6 +216,110 @@ class Storage:
         except (OSError, json.JSONDecodeError) as exc:
             raise StorageError(f"Failed to read alerts: {exc}") from exc
         return alerts
+
+    # ── Watched file operations ────────────────────────────────────────
+
+    def _safe_join_watched(self, relative_path: str) -> Path:
+        """Resolve *relative_path* safely within ``data/watched``."""
+        if not isinstance(relative_path, str) or not relative_path.strip():
+            raise StorageError("File path is required")
+
+        clean = Path(relative_path.strip().replace("\\", "/"))
+        if clean.is_absolute() or ".." in clean.parts:
+            raise StorageError("Invalid file path")
+
+        watched_root = self.watched_dir.resolve()
+        resolved = (watched_root / clean).resolve()
+        if resolved != watched_root and watched_root not in resolved.parents:
+            raise StorageError("Path escapes watched directory")
+        return resolved
+
+    def _backup_watched_file(self, file_path: Path, operation: str) -> Path | None:
+        """Create a timestamped backup under ``runtime/backups`` if file exists."""
+        if not file_path.exists() or not file_path.is_file():
+            return None
+
+        backup_dir = self.runtime_dir / "backups"
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        rel = file_path.relative_to(self.watched_dir.resolve()).as_posix().replace("/", "__")
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        backup_path = backup_dir / f"{stamp}_{operation}_{rel}"
+        shutil.copy2(file_path, backup_path)
+        return backup_path
+
+    def get_watched_file_content(self, relative_path: str) -> dict:
+        """Read watched file content with safety and size checks."""
+        file_path = self._safe_join_watched(relative_path)
+        if not file_path.exists() or not file_path.is_file():
+            raise StorageError("Watched file not found")
+
+        size_bytes = file_path.stat().st_size
+        if size_bytes > self.max_watched_file_bytes:
+            raise StorageError("File is too large to read safely")
+
+        try:
+            content = file_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise StorageError(f"Failed reading watched file: {exc}") from exc
+
+        rel = file_path.relative_to(self.watched_dir.resolve()).as_posix()
+        return {
+            "path": rel,
+            "size_bytes": size_bytes,
+            "content": content,
+        }
+
+    def write_watched_file(self, relative_path: str, content: str) -> dict:
+        """Create or update a watched file and back up previous content."""
+        file_path = self._safe_join_watched(relative_path)
+        text = content if isinstance(content, str) else str(content)
+        payload = text.encode("utf-8")
+        if len(payload) > self.max_watched_file_bytes:
+            raise StorageError("File content exceeds size limit")
+
+        existed = file_path.exists()
+        if existed and file_path.is_dir():
+            raise StorageError("Path points to a directory, not a file")
+
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        backup_path = self._backup_watched_file(file_path, "write")
+
+        tmp_path = file_path.with_suffix(file_path.suffix + ".tmp")
+        try:
+            with open(tmp_path, "wb") as fh:
+                fh.write(payload)
+                fh.flush()
+                os.fsync(fh.fileno())
+            tmp_path.replace(file_path)
+        except OSError as exc:
+            raise StorageError(f"Failed writing watched file: {exc}") from exc
+
+        rel = file_path.relative_to(self.watched_dir.resolve()).as_posix()
+        return {
+            "path": rel,
+            "created": not existed,
+            "size_bytes": len(payload),
+            "backup_path": str(backup_path) if backup_path else None,
+        }
+
+    def delete_watched_file(self, relative_path: str) -> dict:
+        """Delete a watched file after backing it up."""
+        file_path = self._safe_join_watched(relative_path)
+        if not file_path.exists() or not file_path.is_file():
+            raise StorageError("Watched file not found")
+
+        backup_path = self._backup_watched_file(file_path, "delete")
+        try:
+            file_path.unlink()
+        except OSError as exc:
+            raise StorageError(f"Failed deleting watched file: {exc}") from exc
+
+        rel = file_path.relative_to(self.watched_dir.resolve()).as_posix()
+        return {
+            "path": rel,
+            "deleted": True,
+            "backup_path": str(backup_path) if backup_path else None,
+        }
 
     # ── Checkpoints & Recovery ─────────────────────────────────────────
 

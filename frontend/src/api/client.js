@@ -37,6 +37,9 @@ export const getState = () => apiFetch('/api/state')
 
 export const getFiles = () => apiFetch('/api/files')
 
+export const getFileContent = (path) =>
+  apiFetch(`/api/files/content?path=${encodeURIComponent(path)}`)
+
 export const getEvents = (limit = 100, filters = {}) => {
   const params = new URLSearchParams({ limit: String(limit) })
   if (filters.change_type) params.set('change_type', filters.change_type)
@@ -69,6 +72,18 @@ export const getAlerts = (limit = 100, status = 'all') => {
 export const runVerification = () =>
   apiFetch('/api/actions/run-verification', { method: 'POST', body: '{}' })
 
+export const writeFile = (path, content) =>
+  apiFetch('/api/files/write', {
+    method: 'POST',
+    body: JSON.stringify({ path, content }),
+  })
+
+export const deleteFile = (path) =>
+  apiFetch('/api/files/delete', {
+    method: 'POST',
+    body: JSON.stringify({ path }),
+  })
+
 /**
  * Acknowledge an alert by ID (active → acknowledged).
  * @param {string} alertId
@@ -94,6 +109,12 @@ export const restoreCheckpoint = (checkpointFilename) =>
   apiFetch('/api/actions/restore-checkpoint', {
     method: 'POST',
     body: JSON.stringify({ checkpoint_filename: checkpointFilename }),
+  })
+
+export const resolveAlert = (payload) =>
+  apiFetch('/api/alerts/resolve', {
+    method: 'POST',
+    body: JSON.stringify(payload),
   })
 
 export const getAuditActivity = (sessionId = null) => {

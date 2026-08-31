@@ -4,7 +4,7 @@ import {
   Bell, AlertTriangle, XCircle, Info, CheckCircle2,
   Clock, ShieldCheck, ExternalLink, RefreshCw, Eye
 } from 'lucide-react'
-import { getAlerts, acknowledgeAlert, runVerification } from '../api/client'
+import { getAlerts, acknowledgeAlert, runVerification, resolveAlert, getCheckpoints } from '../api/client'
 import DataTable from '../components/DataTable'
 import Drawer from '../components/Drawer'
 import { PageSpinner, ErrorState, EmptyState } from '../components/Spinner'
@@ -55,6 +55,13 @@ export default function Alerts() {
   const [ackLoading, setAckLoading] = useState(false)
   const [verLoading, setVerLoading] = useState(false)
   const [actionMsg,  setActionMsg]  = useState(null)
+  const [resolveLoading, setResolveLoading] = useState(false)
+  const [resolutionAction, setResolutionAction] = useState('run_verification')
+  const [checkpoints, setCheckpoints] = useState([])
+  const [checkpointFilename, setCheckpointFilename] = useState('')
+  const [annotation, setAnnotation] = useState('')
+  const [manualPath, setManualPath] = useState('')
+  const [manualContent, setManualContent] = useState('')
   const navigate = useNavigate()
 
   const fetchAlerts = useCallback(() => {
@@ -69,6 +76,18 @@ export default function Alerts() {
     return () => clearInterval(t)
   }, [fetchAlerts])
 
+  useEffect(() => {
+    getCheckpoints()
+      .then(res => {
+        const list = res?.checkpoints ?? []
+        setCheckpoints(list)
+        if (list.length && !checkpointFilename) {
+          setCheckpointFilename(list[0].filename)
+        }
+      })
+      .catch(() => {})
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps
+
   // Keep drawer in sync when alerts refresh
   useEffect(() => {
     if (sel) {
@@ -76,6 +95,12 @@ export default function Alerts() {
       if (updated) setSel(updated)
     }
   }, [allAlerts]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    if (!sel?.source_path) return
+    const rel = sel.source_path.replace(/\\/g, '/').split('/watched/').pop()
+    setManualPath(rel || '')
+  }, [sel?.alert_id, sel?.source_path])
 
   // ── Tab filtering ────────────────────────────────────────────────
   const displayed = useMemo(() => {
@@ -129,6 +154,41 @@ export default function Alerts() {
       setActionMsg({ type: 'error', text: e.message })
     } finally {
       setVerLoading(false)
+    }
+
+    const handleResolveFlow = async () => {
+      if (!sel) return
+      setResolveLoading(true)
+      setActionMsg(null)
+      try {
+        const payload = {
+          alert_id: sel.alert_id,
+          resolution_action: resolutionAction,
+        }
+        if (resolutionAction === 'restore_checkpoint' && checkpointFilename) {
+          payload.checkpoint_filename = checkpointFilename
+        }
+        if (resolutionAction === 'seal_annotate' && annotation.trim()) {
+          payload.note = annotation.trim()
+        }
+        if (resolutionAction === 'manual_edit') {
+          payload.path = manualPath.trim()
+          payload.content = manualContent
+        }
+        const result = await resolveAlert(payload)
+        const resolved = result?.alert?.status === 'resolved'
+        setActionMsg({
+          type: resolved ? 'success' : 'error',
+          text: resolved
+            ? `✅ Alert resolved via ${resolutionAction.replace('_', ' ')}`
+            : `⚠️ Action completed, alert status: ${result?.alert?.status ?? 'unknown'}`,
+        })
+        await fetchAlerts()
+      } catch (e) {
+        setActionMsg({ type: 'error', text: e.message })
+      } finally {
+        setResolveLoading(false)
+      }
     }
   }
 
@@ -335,6 +395,65 @@ export default function Alerts() {
                       : <><ShieldCheck className="w-4 h-4" /> Run Verification Now</>
                     }
                   </button>
+
+                  <div className="mt-2 space-y-2">
+                    <select
+                      className="select-field w-full"
+                      value={resolutionAction}
+                      onChange={e => setResolutionAction(e.target.value)}
+                    >
+                      <option value="run_verification">Verify only</option>
+                      <option value="restore_checkpoint">Restore checkpoint</option>
+                      <option value="seal_annotate">Seal / annotate</option>
+                      <option value="manual_edit">Manual file edit</option>
+                    </select>
+
+                    {resolutionAction === 'restore_checkpoint' && (
+                      <select
+                        className="select-field w-full"
+                        value={checkpointFilename}
+                        onChange={e => setCheckpointFilename(e.target.value)}
+                      >
+                        {checkpoints.map(cp => (
+                          <option key={cp.filename} value={cp.filename}>{cp.filename}</option>
+                        ))}
+                      </select>
+                    )}
+
+                    {resolutionAction === 'seal_annotate' && (
+                      <textarea
+                        className="input-field min-h-20"
+                        placeholder="Add remediation annotation"
+                        value={annotation}
+                        onChange={e => setAnnotation(e.target.value)}
+                      />
+                    )}
+
+                    {resolutionAction === 'manual_edit' && (
+                      <>
+                        <input
+                          className="input-field"
+                          placeholder="relative/path/file.txt"
+                          value={manualPath}
+                          onChange={e => setManualPath(e.target.value)}
+                        />
+                        <textarea
+                          className="input-field min-h-20"
+                          placeholder="Edited file content"
+                          value={manualContent}
+                          onChange={e => setManualContent(e.target.value)}
+                        />
+                      </>
+                    )}
+
+                    <button
+                      className="btn-secondary w-full justify-center"
+                      onClick={handleResolveFlow}
+                      disabled={resolveLoading || (resolutionAction === 'manual_edit' && !manualPath.trim())}
+                    >
+                      {resolveLoading ? 'Resolving…' : 'Run Guided Resolution'}
+                    </button>
+                  </div>
 
                   {sel.block_index != null && (
                     <button
