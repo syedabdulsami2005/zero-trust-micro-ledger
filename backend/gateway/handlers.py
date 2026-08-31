@@ -23,8 +23,10 @@ import json
 import logging
 import re
 from http.server import BaseHTTPRequestHandler
+from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
+from backend.core.storage import StorageError
 from backend.gateway.context import GatewayContext
 
 logger = logging.getLogger(__name__)
@@ -139,6 +141,7 @@ class LedgerRequestHandler(BaseHTTPRequestHandler):
             "/api/health": self._handle_health,
             "/api/state": self._handle_state,
             "/api/files": self._handle_files,
+            "/api/files/content": lambda: self._handle_file_content(qs),
             "/api/events": lambda: self._handle_events(qs),
             "/api/ledger": lambda: self._handle_ledger(qs),
             "/api/verification": lambda: self._handle_verification(qs),
@@ -166,7 +169,16 @@ class LedgerRequestHandler(BaseHTTPRequestHandler):
             return
 
         # POST-only routes hit via GET → 405
-        post_only = {"/api/actions/run-verification", "/api/exports", "/api/actions/restore-checkpoint", "/api/auth/login", "/api/auth/logout"}
+        post_only = {
+            "/api/actions/run-verification",
+            "/api/actions/restore-checkpoint",
+            "/api/alerts/resolve",
+            "/api/files/write",
+            "/api/files/delete",
+            "/api/exports",
+            "/api/auth/login",
+            "/api/auth/logout",
+        }
         if path in post_only or _ALERT_ACK_RE.match(path):
             self._error(405, "Method not allowed")
             return
@@ -190,6 +202,9 @@ class LedgerRequestHandler(BaseHTTPRequestHandler):
         routes = {
             "/api/actions/run-verification": self._handle_run_verification,
             "/api/actions/restore-checkpoint": self._handle_restore_checkpoint,
+            "/api/alerts/resolve": self._handle_alert_resolve,
+            "/api/files/write": self._handle_file_write,
+            "/api/files/delete": self._handle_file_delete,
             "/api/exports": self._handle_exports,
             "/api/auth/login": self._handle_auth_login,
             "/api/auth/logout": self._handle_auth_logout,
@@ -205,7 +220,7 @@ class LedgerRequestHandler(BaseHTTPRequestHandler):
 
         # GET-only routes hit via POST → 405
         get_only = {
-            "/api/health", "/api/state", "/api/files",
+            "/api/health", "/api/state", "/api/files", "/api/files/content",
             "/api/events", "/api/ledger", "/api/verification", "/api/alerts", "/api/checkpoints", "/api/audit/activity",
         }
         if path in get_only or _LEDGER_BLOCK_RE.match(path):
@@ -278,6 +293,18 @@ class LedgerRequestHandler(BaseHTTPRequestHandler):
             seen[path]["event_count"] += 1
 
         self._send_json(list(seen.values()))
+
+    def _handle_file_content(self, qs: dict) -> None:
+        """`GET /api/files/content?path=...` — read text content from watched directory."""
+        path = self._str_param(qs, "path")
+        if not path:
+            self._error(400, "Query parameter 'path' is required")
+            return
+        try:
+            self._send_json(self.context.storage.get_watched_file_content(path))
+        except StorageError as exc:
+            msg = str(exc)
+            self._error(404 if "not found" in msg.lower() else 400, msg)
 
     def _filter_records(self, records: list[dict], time_from: str = "", time_to: str = "", file_name: str = "", change_type: str = "", from_index: int | None = None, to_index: int | None = None, ts_key: str = "timestamp_utc", is_block: bool = False, alert_id: str = "", incident_id: str = "") -> list[dict]:
         res = records
@@ -414,6 +441,49 @@ class LedgerRequestHandler(BaseHTTPRequestHandler):
         except Exception:
             logger.exception("Failed to record user action in audit log")
 
+    def _determine_source_type(self, rel_path: str) -> str:
+        """Map file extension to a known source_type."""
+        ext = Path(rel_path).suffix.lower()
+        if ext in (".json", ".conf", ".ini", ".cfg", ".yaml", ".yml"):
+            return "config_file"
+        if ext in (".log", ".txt", ".out"):
+            return "log_file"
+        if ext in (".bin", ".exe", ".dll", ".so"):
+            return "binary_file"
+        return "manual"
+
+    def _append_file_action_block(self, operation: str, file_data: dict, alert_id: str | None = None) -> dict:
+        """Append a ledger event for a watched-file mutation."""
+        rel_path = file_data.get("path", "")
+        abs_path = str((self.context.storage.watched_dir / rel_path).resolve())
+        source_type = self._determine_source_type(rel_path)
+        if operation == "write":
+            event_type = "file_created" if file_data.get("created") else "file_modified"
+            change_type = "file_created" if file_data.get("created") else "content_modified"
+            summary = f"Operator {'created' if file_data.get('created') else 'updated'} watched file {rel_path!r}."
+        else:
+            event_type = "file_deleted"
+            change_type = "file_deleted"
+            summary = f"Operator deleted watched file {rel_path!r}."
+        return self.context.engine.append_event({
+            "event_type": event_type,
+            "source_type": source_type,
+            "source_path": abs_path,
+            "source_identifier": rel_path,
+            "log_data": {
+                "summary": summary,
+                "change_type": change_type,
+                "change_label": "manual_remediation",
+                "snapshot_sha256": None,
+                "metadata": {
+                    "actor": "operator",
+                    "size_bytes": file_data.get("size_bytes"),
+                    "backup_path": file_data.get("backup_path"),
+                    "alert_id": alert_id,
+                },
+            },
+        })
+
     def _handle_alert_acknowledge(self, alert_id: str) -> None:
         """`POST /api/alerts/<id>/acknowledge` — acknowledge an alert."""
         self._drain_body()
@@ -447,6 +517,58 @@ class LedgerRequestHandler(BaseHTTPRequestHandler):
         self._record_user_action("RUN_VERIFICATION", "SUCCESS", f"Triggered manual chain verification. Result: {result.blocks_checked} blocks verified healthy (verification_id: {result.verification_id}).")
         self._send_json(response)
 
+    def _handle_file_write(self) -> None:
+        """`POST /api/files/write` — create or update a watched file safely."""
+        if not self.context.state_manager.is_append_enabled():
+            self._error(409, "Append operations are frozen; cannot modify watched files")
+            return
+        body = self._read_body_json()
+        path = body.get("path")
+        if not isinstance(path, str) or not path.strip():
+            self._error(400, "Field 'path' is required")
+            return
+        content = body.get("content", "")
+        try:
+            file_data = self.context.storage.write_watched_file(path, content)
+            block = self._append_file_action_block("write", file_data)
+            self._record_user_action(
+                "WRITE_FILE",
+                "SUCCESS",
+                f"Wrote watched file {file_data.get('path')!r} ({file_data.get('size_bytes')} bytes).",
+            )
+            self._send_json({"success": True, "file": file_data, "block_index": block.get("block_index")})
+        except StorageError as exc:
+            self._error(400, str(exc))
+        except Exception as exc:
+            logger.exception("Failed to write watched file")
+            self._error(500, str(exc))
+
+    def _handle_file_delete(self) -> None:
+        """`POST /api/files/delete` — delete a watched file safely."""
+        if not self.context.state_manager.is_append_enabled():
+            self._error(409, "Append operations are frozen; cannot modify watched files")
+            return
+        body = self._read_body_json()
+        path = body.get("path")
+        if not isinstance(path, str) or not path.strip():
+            self._error(400, "Field 'path' is required")
+            return
+        try:
+            file_data = self.context.storage.delete_watched_file(path)
+            block = self._append_file_action_block("delete", file_data)
+            self._record_user_action(
+                "DELETE_FILE",
+                "SUCCESS",
+                f"Deleted watched file {file_data.get('path')!r}.",
+            )
+            self._send_json({"success": True, "file": file_data, "block_index": block.get("block_index")})
+        except StorageError as exc:
+            msg = str(exc)
+            self._error(404 if "not found" in msg.lower() else 400, msg)
+        except Exception as exc:
+            logger.exception("Failed to delete watched file")
+            self._error(500, str(exc))
+
     def _handle_checkpoints(self) -> None:
         """`GET /api/checkpoints` — list all backup checkpoints."""
         checkpoints = self.context.storage.list_checkpoints()
@@ -463,10 +585,130 @@ class LedgerRequestHandler(BaseHTTPRequestHandler):
             restore_res["verification"] = verification_result.to_dict()
             restore_res["chain_state"] = self.context.state_manager.get_chain_state()
             restore_res["append_enabled"] = self.context.state_manager.is_append_enabled()
+            if restore_res["append_enabled"]:
+                snapshot_block = self.context.engine.append_event({
+                    "event_type": "manual_snapshot",
+                    "source_type": "manual",
+                    "source_path": "manual://restore-checkpoint",
+                    "source_identifier": restore_res.get("restored_from"),
+                    "log_data": {
+                        "summary": f"Operator restored checkpoint {restore_res.get('restored_from')!r}.",
+                        "change_type": "content_modified",
+                        "change_label": "checkpoint_restored",
+                        "snapshot_sha256": None,
+                        "metadata": {"actor": "operator", "size_bytes": restore_res.get("blocks_restored")},
+                    },
+                })
+                restore_res["ledger_block_index"] = snapshot_block.get("block_index")
             self._record_user_action("RESTORE_CHECKPOINT", "SUCCESS", f"Restored active ledger from checkpoint {restore_res.get('restored_from')!r} ({restore_res.get('blocks_restored')} blocks restored).")
             self._send_json(restore_res)
         except Exception as exc:
             logger.exception("Failed to restore from checkpoint")
+            self._error(500, str(exc))
+
+    def _handle_alert_resolve(self) -> None:
+        """`POST /api/alerts/resolve` — orchestrate remediation and verification flow."""
+        if self.context.alert_store is None:
+            self._error(501, "Alert store not initialized")
+            return
+
+        body = self._read_body_json()
+        alert_id = body.get("alert_id")
+        if not isinstance(alert_id, str) or not alert_id.strip():
+            self._error(400, "Field 'alert_id' is required")
+            return
+
+        alert = self.context.alert_store.get_alert_by_id(alert_id)
+        if alert is None:
+            self._error(404, f"Alert {alert_id!r} not found")
+            return
+        if alert.get("status") == "resolved":
+            self._send_json({"success": True, "alert": alert, "message": "Alert already resolved"})
+            return
+
+        action = body.get("resolution_action", "run_verification")
+        response: dict = {"success": True, "alert_id": alert_id, "resolution_action": action}
+        session_summary = f"Resolved alert flow for {alert_id!r} with action {action!r}."
+
+        try:
+            if action == "restore_checkpoint":
+                restore_res = self.context.storage.restore_from_checkpoint(body.get("checkpoint_filename"))
+                response["restore"] = restore_res
+                verification = self.context.daemon.run_once()
+                response["verification"] = verification.to_dict()
+                if self.context.state_manager.is_append_enabled():
+                    snapshot_block = self.context.engine.append_event({
+                        "event_type": "manual_snapshot",
+                        "source_type": "manual",
+                        "source_path": "manual://restore-checkpoint",
+                        "source_identifier": restore_res.get("restored_from"),
+                        "log_data": {
+                            "summary": f"Operator restored checkpoint {restore_res.get('restored_from')!r}.",
+                            "change_type": "content_modified",
+                            "change_label": "checkpoint_restored",
+                            "snapshot_sha256": None,
+                            "metadata": {"actor": "operator", "size_bytes": restore_res.get("blocks_restored"), "alert_id": alert_id},
+                        },
+                    })
+                    response["ledger_block_index"] = snapshot_block.get("block_index")
+
+            elif action == "seal_annotate":
+                if not self.context.state_manager.is_append_enabled():
+                    self._error(409, "Append operations are frozen; restore checkpoint first")
+                    return
+                note = (body.get("note") or "").strip()
+                snapshot_block = self.context.engine.append_event({
+                    "event_type": "manual_snapshot",
+                    "source_type": "manual",
+                    "source_path": "manual://seal-annotate",
+                    "source_identifier": alert_id,
+                    "log_data": {
+                        "summary": note or f"Operator added remediation annotation for alert {alert_id!r}.",
+                        "change_type": "content_modified",
+                        "change_label": "seal_annotation",
+                        "snapshot_sha256": None,
+                        "metadata": {"actor": "operator", "alert_id": alert_id},
+                    },
+                })
+                response["ledger_block_index"] = snapshot_block.get("block_index")
+                verification = self.context.daemon.run_once()
+                response["verification"] = verification.to_dict()
+
+            elif action == "manual_edit":
+                if not self.context.state_manager.is_append_enabled():
+                    self._error(409, "Append operations are frozen; restore checkpoint first")
+                    return
+                path = body.get("path")
+                if not isinstance(path, str) or not path.strip():
+                    self._error(400, "Field 'path' is required for manual_edit")
+                    return
+                file_data = self.context.storage.write_watched_file(path, body.get("content", ""))
+                block = self._append_file_action_block("write", file_data, alert_id=alert_id)
+                response["file"] = file_data
+                response["ledger_block_index"] = block.get("block_index")
+                verification = self.context.daemon.run_once()
+                response["verification"] = verification.to_dict()
+
+            elif action == "run_verification":
+                verification = self.context.daemon.run_once()
+                response["verification"] = verification.to_dict()
+
+            else:
+                self._error(400, "Invalid resolution_action")
+                return
+
+            refreshed = self.context.alert_store.get_alert_by_id(alert_id)
+            response["alert"] = refreshed
+            response["chain_state"] = self.context.state_manager.get_chain_state()
+            response["append_enabled"] = self.context.state_manager.is_append_enabled()
+            self._record_user_action("RESOLVE_ALERT", "SUCCESS", session_summary)
+            self._send_json(response)
+        except StorageError as exc:
+            self._record_user_action("RESOLVE_ALERT", "ERROR", str(exc))
+            self._error(400, str(exc))
+        except Exception as exc:
+            logger.exception("Failed alert resolve flow")
+            self._record_user_action("RESOLVE_ALERT", "ERROR", str(exc))
             self._error(500, str(exc))
 
     def _handle_exports(self) -> None:

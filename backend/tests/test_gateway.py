@@ -402,3 +402,55 @@ class TestErrors:
         # /api/ledger/abc — doesn't match the int pattern → 404
         err = _get(f"{base}/api/ledger/abc", expect_status=404)
         assert err["code"] == 404
+
+
+class TestWatchedFileOps:
+    def test_write_and_read_file_content(self, base):
+        created = _post(f"{base}/api/files/write", {"path": "ops/test_config.json", "content": '{"mode":"safe"}'})
+        assert created["success"] is True
+        assert created["file"]["path"] == "ops/test_config.json"
+
+        content = _get(f"{base}/api/files/content?path=ops/test_config.json")
+        assert content["path"] == "ops/test_config.json"
+        assert content["content"] == '{"mode":"safe"}'
+
+    def test_delete_file_content(self, base):
+        _post(f"{base}/api/files/write", {"path": "ops/delete_me.txt", "content": "to-delete"})
+        deleted = _post(f"{base}/api/files/delete", {"path": "ops/delete_me.txt"})
+        assert deleted["success"] is True
+        assert deleted["file"]["deleted"] is True
+
+        err = _get(f"{base}/api/files/content?path=ops/delete_me.txt", expect_status=404)
+        assert err["code"] == 404
+
+    def test_write_rejects_path_escape(self, base):
+        err = _post(f"{base}/api/files/write", {"path": "../escape.txt", "content": "x"}, expect_status=400)
+        assert err["code"] == 400
+
+
+class TestAlertResolutionFlow:
+    def test_restore_checkpoint_resolution_flow(self, base, gateway_env):
+        # Ensure we have a fresh checkpoint from a healthy chain first
+        _post(f"{base}/api/actions/run-verification")
+
+        # Tamper the tail block on disk to force an alert
+        storage = gateway_env._context.storage
+        blocks = storage.read_all_blocks()
+        blocks[-1]["current_hash"] = "f" * 64
+        with open(storage.ledger_file, "w", encoding="utf-8") as fh:
+            for block in blocks:
+                fh.write(json.dumps(block, sort_keys=True, separators=(",", ":")) + "\n")
+
+        verify = _post(f"{base}/api/actions/run-verification")
+        assert verify["healthy"] is False
+
+        alerts = _get(f"{base}/api/alerts?status=unresolved")
+        assert alerts, "Expected unresolved alerts after tampering"
+
+        resolved = _post(
+            f"{base}/api/alerts/resolve",
+            {"alert_id": alerts[0]["alert_id"], "resolution_action": "restore_checkpoint"},
+        )
+        assert resolved["success"] is True
+        assert resolved["resolution_action"] == "restore_checkpoint"
+        assert resolved["chain_state"] == "healthy"

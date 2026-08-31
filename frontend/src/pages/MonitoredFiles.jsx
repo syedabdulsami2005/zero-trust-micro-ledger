@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { FolderOpen, Activity } from 'lucide-react'
-import { getFiles, getEvents } from '../api/client'
+import { getFiles, getEvents, getFileContent, writeFile, deleteFile } from '../api/client'
 import DataTable from '../components/DataTable'
 import Drawer from '../components/Drawer'
 import { PageSpinner, ErrorState, EmptyState } from '../components/Spinner'
@@ -25,19 +25,97 @@ export default function MonitoredFiles() {
   const [drawerOpen, setDrawerOpen] = useState(false)
   const [loading,    setLoading]    = useState(true)
   const [error,      setError]      = useState(null)
+  const [fileContent, setFileContent] = useState('')
+  const [contentLoading, setContentLoading] = useState(false)
+  const [saving, setSaving] = useState(false)
+  const [deleting, setDeleting] = useState(false)
+  const [newPath, setNewPath] = useState('')
+  const [newContent, setNewContent] = useState('')
+  const [actionMsg, setActionMsg] = useState(null)
 
-  useEffect(() => {
-    Promise.all([getFiles(), getEvents(500)])
+  const load = () => {
+    return Promise.all([getFiles(), getEvents(500)])
       .then(([f, ev]) => { setFiles(f); setEvents(ev) })
       .catch(e => setError(e.message))
+  }
+
+  useEffect(() => {
+    load()
       .finally(() => setLoading(false))
   }, [])
 
-  const handleRowClick = (row) => { setSel(row); setDrawerOpen(true) }
+  const handleRowClick = async (row) => {
+    setSel(row)
+    setDrawerOpen(true)
+    setActionMsg(null)
+    setContentLoading(true)
+    try {
+      const relPath = row.source_path.replace(/\\/g, '/').split('/watched/').pop()
+      const res = await getFileContent(relPath)
+      setFileContent(res?.content ?? '')
+    } catch {
+      setFileContent('')
+    } finally {
+      setContentLoading(false)
+    }
+  }
 
   const fileEvents = sel
     ? events.filter(ev => ev.source_path === sel.source_path)
     : []
+
+  const selectedRelativePath = sel?.source_path
+    ? sel.source_path.replace(/\\/g, '/').split('/watched/').pop()
+    : ''
+
+  const handleSaveSelected = async () => {
+    if (!selectedRelativePath) return
+    setSaving(true)
+    setActionMsg(null)
+    try {
+      await writeFile(selectedRelativePath, fileContent)
+      await load()
+      setActionMsg({ type: 'success', text: 'File saved successfully' })
+    } catch (e) {
+      setActionMsg({ type: 'error', text: e.message })
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const handleDeleteSelected = async () => {
+    if (!selectedRelativePath) return
+    setDeleting(true)
+    setActionMsg(null)
+    try {
+      await deleteFile(selectedRelativePath)
+      await load()
+      setDrawerOpen(false)
+      setSel(null)
+      setActionMsg({ type: 'success', text: 'File deleted' })
+    } catch (e) {
+      setActionMsg({ type: 'error', text: e.message })
+    } finally {
+      setDeleting(false)
+    }
+  }
+
+  const handleCreateFile = async () => {
+    if (!newPath.trim()) return
+    setSaving(true)
+    setActionMsg(null)
+    try {
+      await writeFile(newPath.trim(), newContent)
+      setNewPath('')
+      setNewContent('')
+      await load()
+      setActionMsg({ type: 'success', text: 'New watched file created' })
+    } catch (e) {
+      setActionMsg({ type: 'error', text: e.message })
+    } finally {
+      setSaving(false)
+    }
+  }
 
   const columns = [
     {
@@ -76,6 +154,24 @@ export default function MonitoredFiles() {
 
       {/* ── Table card ───────────────────────────────────── */}
       <div className="card overflow-hidden">
+        <div className="p-4 border-b border-surface-subtle space-y-2 bg-surface-warm">
+          <p className="section-header">Create / Edit Watched File</p>
+          <input
+            className="input-field"
+            placeholder="relative/path/file.txt"
+            value={newPath}
+            onChange={e => setNewPath(e.target.value)}
+          />
+          <textarea
+            className="input-field min-h-24"
+            placeholder="Initial file content"
+            value={newContent}
+            onChange={e => setNewContent(e.target.value)}
+          />
+          <button className="btn-primary" disabled={saving || !newPath.trim()} onClick={handleCreateFile}>
+            {saving ? 'Saving…' : 'Create File'}
+          </button>
+        </div>
         <div className="panel-header">
           <h2 className="card-title flex items-center gap-2">
             <FolderOpen className="w-4 h-4 text-accent" />
@@ -156,6 +252,30 @@ export default function MonitoredFiles() {
                   </div>
                 )
               }
+            </div>
+
+            {/* Manual editor */}
+            <div className="border-t border-surface-subtle pt-4 space-y-3">
+              <p className="section-header">Manual Edit</p>
+              <textarea
+                className="input-field min-h-36 mono"
+                value={fileContent}
+                onChange={e => setFileContent(e.target.value)}
+                disabled={contentLoading}
+              />
+              <div className="flex gap-2">
+                <button className="btn-primary" onClick={handleSaveSelected} disabled={saving || contentLoading}>
+                  {saving ? 'Saving…' : 'Save File'}
+                </button>
+                <button className="btn-secondary" onClick={handleDeleteSelected} disabled={deleting || contentLoading}>
+                  {deleting ? 'Deleting…' : 'Delete File'}
+                </button>
+              </div>
+              {actionMsg && (
+                <p className={`text-xs ${actionMsg.type === 'success' ? 'text-ok' : 'text-danger'}`}>
+                  {actionMsg.text}
+                </p>
+              )}
             </div>
           </div>
         )}

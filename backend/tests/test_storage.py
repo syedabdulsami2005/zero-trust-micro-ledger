@@ -174,3 +174,32 @@ class TestAlerts:
 
     def test_empty_returns_list(self, storage):
         assert storage.read_alerts() == []
+
+
+class TestWatchedFiles:
+    def test_safe_join_rejects_traversal(self, storage):
+        with pytest.raises(StorageError):
+            storage._safe_join_watched("../outside.txt")
+
+    def test_write_read_delete_roundtrip_with_backup(self, storage):
+        first = storage.write_watched_file("demo/a.txt", "hello")
+        assert first["created"] is True
+        assert first["backup_path"] is None
+
+        second = storage.write_watched_file("demo/a.txt", "updated")
+        assert second["created"] is False
+        assert second["backup_path"] is not None
+
+        loaded = storage.get_watched_file_content("demo/a.txt")
+        assert loaded["content"] == "updated"
+        assert loaded["size_bytes"] == len("updated".encode("utf-8"))
+
+        deleted = storage.delete_watched_file("demo/a.txt")
+        assert deleted["deleted"] is True
+        assert deleted["backup_path"] is not None
+        assert not (storage.watched_dir / "demo" / "a.txt").exists()
+
+    def test_write_rejects_oversized_content(self, storage):
+        storage.max_watched_file_bytes = 4
+        with pytest.raises(StorageError):
+            storage.write_watched_file("tiny.txt", "12345")
